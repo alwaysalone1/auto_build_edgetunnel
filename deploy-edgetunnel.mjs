@@ -38,6 +38,9 @@ const DEFAULT_COMPATIBILITY_DATE = '2026-06-13';
 const DEFAULT_WORKER_SOURCE = path.resolve('_et', '_worker.js');
 const DEFAULT_STATE_FILE = path.resolve('edgetunnel-deploy.state.json');
 const DEFAULT_CRED_FILE = path.resolve('edgetunnel-credentials.json');
+/** 多账号隔离：state/凭据按账号分文件，避免账号之间串状态或互相覆盖 */
+const defaultStateFile = (aid = '') => (aid ? path.resolve(`edgetunnel-deploy.state.${aid}.json`) : DEFAULT_STATE_FILE);
+const defaultCredFile = (aid = '') => (aid ? path.resolve(`edgetunnel-credentials.${aid}.json`) : DEFAULT_CRED_FILE);
 const WRITE_EDIT_WORD_RE = /\b(write|edit)\b/ig;
 
 // edgetunnel 需要的权限：Workers 脚本 + KV 命名空间读写 + Zone/DNS/Route
@@ -162,57 +165,80 @@ const env = process.env;
 const slug = (n = 4) => randomBytes(n).toString('hex');
 
 function loadState() {
-  const f = args.stateFile || DEFAULT_STATE_FILE;
-  if (!existsSync(f)) return {};
-  try { return JSON.parse(readFileSync(f, 'utf8')); } catch { return {}; }
+  const f = args.stateFile || defaultStateFile(args.accountId || env.CF_ACCOUNT_ID);
+  const read = (p) => { try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; } };
+  const st = existsSync(f) ? read(f) : null;
+  if (st) return st;
+  // 旧版单文件兼容：仅当账号匹配时才回退，避免新账号读到旧账号的 state
+  const legacy = DEFAULT_STATE_FILE;
+  if (f !== legacy && existsSync(legacy)) {
+    const ls = read(legacy);
+    if (ls && (!ls.accountId || !(args.accountId || env.CF_ACCOUNT_ID) || ls.accountId === (args.accountId || env.CF_ACCOUNT_ID))) {
+      console.log(`[state] 回退使用旧版单文件 ${path.basename(legacy)}（账号 ${ls.accountId ? ls.accountId.slice(0, 8) + '…' : '未标记'}），下次运行将写入按账号分文件`);
+      return ls;
+    }
+  }
+  return {};
 }
 const state = loadState();
+
+// 显式换了 zone 或 account-id 且与 state 不一致 → 视为全新部署，
+// 不继承旧账号的 hostname/workerName/kvId/admin/key/uuid 等身份字段
+const explicitZone = args.zoneName || env.CF_ZONE_NAME;
+const explicitAccount = args.accountId || env.CF_ACCOUNT_ID;
+const stateMatches = !(
+  (explicitZone && state.zoneName && explicitZone !== state.zoneName) ||
+  (explicitAccount && state.accountId && explicitAccount !== state.accountId)
+);
+
+const cfgAccountId = args.accountId || env.CF_ACCOUNT_ID || state.accountId || '';
 
 const config = {
   token: args.token || env.CF_API_TOKEN || env.CLOUDFLARE_API_TOKEN,
   dashboardCookie: args.dashboardCookie || env.CF_DASH_COOKIE || '',
   dashboardAtok: args.dashboardAtok || env.CF_DASH_ATOK || '',
   dashboardVses2: args.dashboardVses2 || env.CF_DASH_VSES2 || env.VSES2,
-  accountId: args.accountId || env.CF_ACCOUNT_ID || state.accountId,
-  zoneName: args.zoneName || env.CF_ZONE_NAME || state.zoneName || args.positional[0] || '',
-  hostname: args.hostname || env.CF_HOSTNAME || state.hostname || '',
-  workerName: args.workerName || env.CF_WORKER_NAME || state.workerName || `edt-${slug(6)}`,
-  kvTitle: args.kvTitle || env.CF_KV_TITLE || state.kvTitle || 'edgetunnel-kv',
-  kvId: args.kvId || env.CF_KV_ID || state.kvId || '',
+  accountId: cfgAccountId,
+  zoneName: args.zoneName || env.CF_ZONE_NAME || (stateMatches ? state.zoneName : '') || args.positional[0] || '',
+  hostname: args.hostname || env.CF_HOSTNAME || (stateMatches ? state.hostname : '') || '',
+  workerName: args.workerName || env.CF_WORKER_NAME || (stateMatches ? state.workerName : '') || `edt-${slug(6)}`,
+  kvTitle: args.kvTitle || env.CF_KV_TITLE || (stateMatches ? state.kvTitle : '') || 'edgetunnel-kv',
+  kvId: args.kvId || env.CF_KV_ID || (stateMatches ? state.kvId : '') || '',
   workerSource: path.resolve(args.workerSource || env.EDT_WORKER_SOURCE || DEFAULT_WORKER_SOURCE),
   compatibilityDate: args.compatibilityDate || env.CF_COMPATIBILITY_DATE || DEFAULT_COMPATIBILITY_DATE,
-  stateFile: args.stateFile || DEFAULT_STATE_FILE,
-  credFile: args.credFile || DEFAULT_CRED_FILE,
-  // 凭据：优先命令行/环境变量，其次复用 state（保证 --reconfigure 不改变 UUID）
-  admin: args.admin || env.EDT_ADMIN || state.admin || slug(12) + slug(6),
-  key: args.key || env.EDT_KEY || state.key || slug(8),
-  uuid: args.uuid || env.EDT_UUID || state.uuid || '',
+  stateFile: args.stateFile || defaultStateFile(cfgAccountId),
+  credFile: args.credFile || defaultCredFile(cfgAccountId),
+  // 凭据：优先命令行/环境变量；仅同一账号（stateMatches）才复用 state 凭据，
+  // 保证 --reconfigure 不改变 UUID，同时换账号部署生成全新 ADMIN/KEY，不跨账号共享
+  admin: args.admin || env.EDT_ADMIN || (stateMatches ? state.admin : '') || slug(12) + slug(6),
+  key: args.key || env.EDT_KEY || (stateMatches ? state.key : '') || slug(8),
+  uuid: args.uuid || env.EDT_UUID || (stateMatches ? state.uuid : '') || '',
   nodes: Number.isFinite(args.nodes) ? args.nodes : (Number(env.EDT_NODES) || state.nodes || 500),
   // 订阅自动刷新间隔（小时）：写进 config 的 SUBUpdateTime，Worker 会随订阅响应下发
   // Profile-Update-Interval 头；v2rayN 的「订阅分组→自动更新间隔」按它或客户端设置定时拉取，
   // 不用进面板手动刷新。默认 2 小时（用户要求；注意随机IP模式下每次刷新节点 IP 全换）。
   subUpdateTime: Number.isFinite(args.subUpdateTime) ? args.subUpdateTime : (Number(env.EDT_SUB_UPDATE_TIME) || state.subUpdateTime || 2),
   // 稳定节点池：--add-ips 写入 KV ADD.txt 并关闭随机IP；--random-ips 恢复随机（与 --add-ips 互斥）
-  addIps: args.addIps || env.EDT_ADD_IPS || state.addIps || '',
-  randomIps: args.randomIps ? true : !(args.addIps || env.EDT_ADD_IPS || state.addIps),
+  addIps: args.addIps || env.EDT_ADD_IPS || (stateMatches ? state.addIps : '') || '',
+  randomIps: args.randomIps ? true : !(args.addIps || env.EDT_ADD_IPS || (stateMatches ? state.addIps : '')),
   // 伪装页：env.URL（nginx=内置默认页 / 1101=内置HTML / 任意站点域名=反代该站）
-  fakePage: args.fakePage || env.EDT_FAKE_PAGE || state.fakePage || '',
+  fakePage: args.fakePage || env.EDT_FAKE_PAGE || (stateMatches ? state.fakePage : '') || '',
   // TG 通知 + CF 用量统计（写入 tg.json / cf.json，Worker 在 L5797/L5812 覆盖读取）
-  tgBot: args.tgBot || env.EDT_TG_BOT || state.tgBot || '',
-  tgChat: args.tgChat || env.EDT_TG_CHAT || state.tgChat || '',
-  cfEmail: args.cfEmail || env.EDT_CF_EMAIL || state.cfEmail || '',
-  cfKey: args.cfKey || env.EDT_CF_KEY || state.cfKey || '',
-  cfToken: args.cfToken || env.EDT_CF_TOKEN || state.cfToken || '',
+  tgBot: args.tgBot || env.EDT_TG_BOT || (stateMatches ? state.tgBot : '') || '',
+  tgChat: args.tgChat || env.EDT_TG_CHAT || (stateMatches ? state.tgChat : '') || '',
+  cfEmail: args.cfEmail || env.EDT_CF_EMAIL || (stateMatches ? state.cfEmail : '') || '',
+  cfKey: args.cfKey || env.EDT_CF_KEY || (stateMatches ? state.cfKey : '') || '',
+  cfToken: args.cfToken || env.EDT_CF_TOKEN || (stateMatches ? state.cfToken : '') || '',
   port: Number.isFinite(args.port) ? args.port : -1,
-  proxyip: args.proxyip || env.EDT_PROXYIP || state.proxyip || 'auto',
-  nodePath: args.nodePath || env.EDT_PATH || state.nodePath || '/',
-  transport: args.transport || env.EDT_TRANSPORT || state.transport || 'ws',
-  protocol: args.protocol || env.EDT_PROTOCOL || state.protocol || 'vless',
-  subName: args.subName || env.EDT_SUB_NAME || state.subName || 'EdgeTunnel',
-  subapi: args.subapi || env.EDT_SUBAPI || state.subapi || 'https://SUBAPI.cmliussss.net',
+  proxyip: args.proxyip || env.EDT_PROXYIP || (stateMatches ? state.proxyip : '') || 'auto',
+  nodePath: args.nodePath || env.EDT_PATH || (stateMatches ? state.nodePath : '') || '/',
+  transport: args.transport || env.EDT_TRANSPORT || (stateMatches ? state.transport : '') || 'ws',
+  protocol: args.protocol || env.EDT_PROTOCOL || (stateMatches ? state.protocol : '') || 'vless',
+  subName: args.subName || env.EDT_SUB_NAME || (stateMatches ? state.subName : '') || 'EdgeTunnel',
+  subapi: args.subapi || env.EDT_SUBAPI || (stateMatches ? state.subapi : '') || 'https://SUBAPI.cmliussss.net',
   // SOCKS5 域名白名单只能走 env：_worker.js L2432 读的是模块级全局 SOCKS5白名单（L3），
   // config.json 里的 反代.SOCKS5.白名单 从不被读取，面板改它无效。L50-53 只从 env.GO2SOCKS5 追加。
-  go2socks5: args.go2socks5 || env.EDT_GO2SOCKS5 || state.go2socks5 || '',
+  go2socks5: args.go2socks5 || env.EDT_GO2SOCKS5 || (stateMatches ? state.go2socks5 : '') || '',
   reconfigure: !!args.reconfigure,
   destroy: !!args.destroy,
   revokeToken: !!args.revokeToken,
@@ -531,6 +557,11 @@ async function createApiTokenFromDashboardSession({ accountId, vses2, cookie, at
   }
   const result = await dashboardSessionFetch('/user/tokens', {
     accountId, vses2, cookie, atok, method: 'POST', body: { ...DEFAULT_TOKEN_PAYLOAD, policies },
+  }).catch((e) => {
+    if (/1211|verify your email|验证.*邮箱|邮箱.*验证/i.test(e.message)) {
+      throw new Error(`创建 API Token 被拒（1211）：该 Cloudflare 账号的邮箱尚未验证。\n请先登录 dash.cloudflare.com → 右上角头像 → 邮箱处完成验证（或去收件箱找 Cloudflare 验证邮件），验证后再重跑。`);
+    }
+    throw e;
   });
   const token = result?.value || result?.token;
   if (!token) throw new Error('Cloudflare 创建了 Token，但响应里没有返回 value。');
