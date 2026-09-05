@@ -120,6 +120,14 @@ function readArgs(argv) {
     else if (name === 'nodes') o.nodes = Number(next());
     else if (name === 'port') o.port = Number(next());
     else if (name === 'sub-update-time') o.subUpdateTime = Number(next());
+    else if (name === 'add-ips') o.addIps = next();
+    else if (name === 'random-ips') o.randomIps = true;
+    else if (name === 'fake-page') o.fakePage = next();
+    else if (name === 'tg-bot') o.tgBot = next();
+    else if (name === 'tg-chat') o.tgChat = next();
+    else if (name === 'cf-email') o.cfEmail = next();
+    else if (name === 'cf-key') o.cfKey = next();
+    else if (name === 'cf-token') o.cfToken = next();
     else if (name === 'kv-title') o.kvTitle = next();
     else if (name === 'kv-id') o.kvId = next();
     else if (name === 'proxyip') o.proxyip = next();
@@ -184,6 +192,17 @@ const config = {
   // Profile-Update-Interval 头；v2rayN 的「订阅分组→自动更新间隔」按它或客户端设置定时拉取，
   // 不用进面板手动刷新。默认 2 小时（用户要求；注意随机IP模式下每次刷新节点 IP 全换）。
   subUpdateTime: Number.isFinite(args.subUpdateTime) ? args.subUpdateTime : (Number(env.EDT_SUB_UPDATE_TIME) || state.subUpdateTime || 2),
+  // 稳定节点池：--add-ips 写入 KV ADD.txt 并关闭随机IP；--random-ips 恢复随机（与 --add-ips 互斥）
+  addIps: args.addIps || env.EDT_ADD_IPS || state.addIps || '',
+  randomIps: args.randomIps ? true : !(args.addIps || env.EDT_ADD_IPS || state.addIps),
+  // 伪装页：env.URL（nginx=内置默认页 / 1101=内置HTML / 任意站点域名=反代该站）
+  fakePage: args.fakePage || env.EDT_FAKE_PAGE || state.fakePage || '',
+  // TG 通知 + CF 用量统计（写入 tg.json / cf.json，Worker 在 L5797/L5812 覆盖读取）
+  tgBot: args.tgBot || env.EDT_TG_BOT || state.tgBot || '',
+  tgChat: args.tgChat || env.EDT_TG_CHAT || state.tgChat || '',
+  cfEmail: args.cfEmail || env.EDT_CF_EMAIL || state.cfEmail || '',
+  cfKey: args.cfKey || env.EDT_CF_KEY || state.cfKey || '',
+  cfToken: args.cfToken || env.EDT_CF_TOKEN || state.cfToken || '',
   port: Number.isFinite(args.port) ? args.port : -1,
   proxyip: args.proxyip || env.EDT_PROXYIP || state.proxyip || 'auto',
   nodePath: args.nodePath || env.EDT_PATH || state.nodePath || '/',
@@ -244,8 +263,9 @@ function buildOptimalConfig(host) {
     优选订阅生成: {
       local: true,
       本地IP库: {
-        随机IP: true,
-        随机数量: config.nodes,
+        随机IP: config.randomIps,
+        // 稳定池（--add-ips）时随机数量取列表条数；随机模式取 --nodes
+        随机数量: config.randomIps ? config.nodes : (parseIpList(config.addIps).length || config.nodes),
         // -1 = 在 [443,2053,2083,2087,2096,8443] 中随机，避免单端口被一锅端
         指定端口: config.port,
       },
@@ -284,9 +304,11 @@ function buildOptimalConfig(host) {
         SSTP: { 全局: 'sstp://' + placeholder, 标准: 'sstp=' + placeholder },
       },
     },
-    TG: { 启用: false, BotToken: null, ChatID: null },
+    TG: { 启用: !!(config.tgBot && config.tgChat), BotToken: config.tgBot || null, ChatID: config.tgChat || null },
     CF: {
-      Email: null, GlobalAPIKey: null, AccountID: null, APIToken: null, UsageAPI: null,
+      Email: config.cfEmail || null, GlobalAPIKey: config.cfKey || null,
+      AccountID: (config.cfToken || config.cfEmail) ? config.accountId : null,
+      APIToken: config.cfToken || null, UsageAPI: null,
       Usage: { success: false, pages: 0, workers: 0, total: 0, max: 100000 },
     },
   };
@@ -314,6 +336,38 @@ const hasFullDashboardCookie = () => {
   const c = String(config.dashboardCookie || '');
   return c.includes('vses2=') && c.includes('cf_clearance=');
 };
+
+/** 严格校验 ip[:port][#名称]：八位组 0-255、端口 1-65535 */
+function isValidIpPortEntry(t) {
+  const m = String(t).match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?::(\d{1,5}))?(?:#.*)?$/);
+  if (!m) return false;
+  for (let i = 1; i <= 4; i++) if (Number(m[i]) > 255) return false;
+  if (m[5] && (Number(m[5]) < 1 || Number(m[5]) > 65535)) return false;
+  return true;
+}
+
+/** 解析 --add-ips：逗号/分号/换行分隔；支持 file:路径 读取本地文件；每条 ip[:port][#名称] */
+function parseIpList(raw) {
+  const source = String(raw || '');
+  const chunks = source.split(/[\r\n,;]+/).map((s) => s.trim()).filter(Boolean);
+  const out = [];
+  for (const chunk of chunks) {
+    if (/^file:/i.test(chunk)) {
+      const f = chunk.slice(5).trim().replace(/^["']|["']$/g, '');
+      if (!existsSync(f)) fail(`--add-ips 文件不存在：${f}`);
+      for (const line of readFileSync(f, 'utf8').split(/\r?\n/)) {
+        const t = line.trim();
+        if (t && !t.startsWith('#')) out.push(t);
+      }
+      continue;
+    }
+    if (!isValidIpPortEntry(chunk)) {
+      fail(`--add-ips 条目格式不对：${chunk}（应为 ip[:port][#名称]，可用 file:路径 读取文件）`);
+    }
+    out.push(chunk);
+  }
+  return [...new Set(out)];
+}
 
 function errorDetail(body, fallback) {
   const errors = Array.isArray(body?.errors) ? body.errors : [];
@@ -531,6 +585,8 @@ async function deployWorker(source) {
   ];
   // 白名单唯一有效入口（见上方注释）
   if (config.go2socks5) bindings.push({ type: 'plain_text', name: 'GO2SOCKS5', text: String(config.go2socks5) });
+  // 伪装页：env.URL（_worker.js L504），nginx=内置默认 / 1101=内置HTML / 站点域名=反代该站
+  if (config.fakePage) bindings.push({ type: 'plain_text', name: 'URL', text: String(config.fakePage) });
   const metadata = {
     main_module: 'worker.js',
     compatibility_date: config.compatibilityDate,
@@ -547,6 +603,14 @@ async function deployWorker(source) {
   log('3', 'Worker 已上传，ADMIN/KEY/KV 绑定已随脚本一并写入');
 }
 
+async function writeKvKey(key, body) {
+  if (config.dryRun) { log('4', `[dry-run] 将写入 KV ${key}`); return; }
+  if (!config.kvId) fail('写 KV 需要命名空间 id（--kv-id 或 state 文件）。');
+  const endpoint = `/accounts/${config.accountId}/storage/kv/namespaces/${config.kvId}/values/${encodeURIComponent(key)}`;
+  await cfFetch(endpoint, { method: 'PUT', body });
+  log('4', `KV ${key} 已写入（${String(body).length} 字节）`);
+}
+
 async function writeKvConfig(host) {
   if (config.skipKvConfig) { log('4', '已按 --skip-kv-config 跳过配置写入'); return; }
   const cfg = buildOptimalConfig(host);
@@ -558,9 +622,33 @@ async function writeKvConfig(host) {
   // 注意：CF KV 的 values/{key} 端点把请求体【原样】存为值，不会解包 {"value": ...}。
   // 之前用 { value: ... } 包装导致 Worker JSON.parse 得到 {value: "..."}，订阅 500（读取config_JSON L5713）。
   // 正确做法：body 直接就是 config JSON 字符串。
-  const endpoint = `/accounts/${config.accountId}/storage/kv/namespaces/${config.kvId}/values/config.json`;
-  await cfFetch(endpoint, { method: 'PUT', body: JSON.stringify(cfg, null, 2) });
+  await writeKvKey('config.json', JSON.stringify(cfg, null, 2));
   log('4', `config.json 已写入 KV：协议=${config.protocol} 传输=${config.transport} 节点数=${config.nodes} 随机路径=on`);
+
+  // 稳定节点池：--add-ips → KV ADD.txt + 随机IP=false（Worker L358 优先读 ADD.txt）
+  const addIpEntries = config.randomIps ? [] : parseIpList(config.addIps);
+  if (addIpEntries.length) {
+    await writeKvKey('ADD.txt', addIpEntries.join('\n'));
+    log('4', `稳定节点池已写入 ADD.txt：${addIpEntries.length} 条（随机IP=false，2 小时刷新不再换 IP）`);
+  }
+
+  // TG 通知（Worker L5799 读 tg.json 覆盖 config.TG）
+  if (config.tgBot && config.tgChat) {
+    await writeKvKey('tg.json', JSON.stringify({ BotToken: config.tgBot, ChatID: config.tgChat }, null, 2));
+    log('4', `TG 通知已启用（BotToken 掩码：${String(config.tgBot).slice(0, 6)}***）`);
+  }
+
+  // CF 用量统计（Worker L5814 读 cf.json；注意：APIToken 会明文进 KV，仅限你自己的命名空间）
+  if (config.cfEmail || config.cfKey || config.cfToken) {
+    await writeKvKey('cf.json', JSON.stringify({
+      Email: config.cfEmail || null,
+      GlobalAPIKey: config.cfKey || null,
+      AccountID: config.accountId || null,
+      APIToken: config.cfToken || null,
+      UsageAPI: null,
+    }, null, 2));
+    log('4', 'CF 用量统计凭据已写入 cf.json');
+  }
 }
 
 async function findZone() {
@@ -806,6 +894,13 @@ function saveState(extra = {}) {
     nodes: config.nodes,
     port: config.port,
     subUpdateTime: config.subUpdateTime,
+    addIps: config.addIps,
+    fakePage: config.fakePage,
+    tgBot: config.tgBot,
+    tgChat: config.tgChat,
+    cfEmail: config.cfEmail,
+    cfKey: config.cfKey,
+    cfToken: config.cfToken,
     proxyip: config.proxyip,
     nodePath: config.nodePath,
     transport: config.transport,
@@ -885,6 +980,13 @@ function ensureConfig() {
   if (config.port !== -1 && ![443, 2053, 2083, 2087, 2096, 8443, 80, 8080, 2052, 2082, 2086, 2095].includes(config.port)) {
     fail(`--port ${config.port} 不是 CF 支持的端口。可选：443 2053 2083 2087 2096 8443（TLS）/ 80 2052 2082 2086 2095 8080（非 TLS）；-1 表示随机。`);
   }
+  // 稳定池 / 伪装页 / TG / CF 参数互斥与必配项
+  if (args.randomIps && (args.addIps || env.EDT_ADD_IPS)) fail('--random-ips 与 --add-ips 不能同时使用。');
+  if (config.addIps && /\s/.test(config.addIps) && !/^file:/i.test(config.addIps)) fail('--add-ips 值里不能有空格（用逗号/分号/换行分隔，或 file:路径）。');
+  if (config.fakePage && (/\s/.test(config.fakePage) || /[/?#]/.test(config.fakePage.replace(/^https?:\/\//i, '')))) fail('--fake-page 只接受域名或 nginx/1101（不带路径）。');
+  if ((config.tgBot && !config.tgChat) || (!config.tgBot && config.tgChat)) fail('--tg-bot 与 --tg-chat 需成对提供。');
+  if ((config.cfEmail && !config.cfKey) || (config.cfKey && !config.cfEmail)) fail('--cf-email 与 --cf-key 需成对提供（或改用 --cf-token）。');
+  if (config.cfToken && (config.cfEmail || config.cfKey)) fail('--cf-token 与 --cf-email/--cf-key 二选一。');
   if (config.reconfigure) return;
   if (!config.zoneName) fail('缺少根域名 --zone。edgetunnel 的 /sub、/admin、<KEY> 都靠域名路由。');
   if (!config.hostname.endsWith(config.zoneName)) fail(`--hostname 必须在 ${config.zoneName} 下面。`);
@@ -903,12 +1005,19 @@ function usage() {
             --port <p>            固定端口；-1 = 在 6 个 TLS 端口间随机（默认）
             --sub-update-time <h> 订阅自动刷新间隔小时数，默认 2（Worker 随响应下发
                                   Profile-Update-Interval 头；v2rayN 在订阅分组里也可设）
+节点池      --add-ips <列表>      稳定节点池：ip:port[,ip:port] 或 file:路径（每行一条）；
+                                  写入 KV ADD.txt 并关闭随机IP，2 小时刷新不再换 IP
+            --random-ips          恢复随机 IP 模式（与 --add-ips 互斥）
 协议        --protocol <p>        vless | trojan | ss   （默认 vless）
             --transport <t>       ws | grpc | xhttp     （默认 ws）
             --path </p>           节点基础路径，默认 /
 反代        --proxyip <host:port> 反代出口；默认 auto 走 {colo}.proxyip.cmliussss.net
             --go2socks5 <域名列表> 走 SOCKS5 的域名白名单（逗号分隔）。注意：此字段只能走环境变量，
                                   config.json 里的 反代.SOCKS5.白名单 不被 Worker 读取（L2432 读全局变量）
+伪装页      --fake-page <域名>    env.URL：nginx=内置默认 / 1101=内置HTML / 站点域名=反代该站作伪装
+通知/统计  --tg-bot <token> --tg-chat <id>   启用 TG 订阅访问通知（写入 tg.json）
+            --cf-email <邮箱> --cf-key <GAK>  启用 CF 用量统计（Global API Key）
+            --cf-token <token>                或用 API Token 替代邮箱+GlobalKey（写入 cf.json）
 资源        --kv-title <名>       KV 命名空间名（默认 edgetunnel-kv）
             --kv-id <id>          复用已有 KV
             --worker-name <n>     Worker 名（默认随机 edt-xxxx）
@@ -924,7 +1033,8 @@ function usage() {
             --state-file / --cred-file   state 与凭据落盘路径
 
 环境变量    CF_API_TOKEN CF_ACCOUNT_ID CF_ZONE_NAME CF_HOSTNAME EDT_ADMIN EDT_KEY EDT_NODES
-            EDT_PROXYIP EDT_TRANSPORT EDT_PROTOCOL EDT_SUB_UPDATE_TIME EDT_DROP_KV=1（拆除时连 KV 一起删）`);
+            EDT_PROXYIP EDT_TRANSPORT EDT_PROTOCOL EDT_SUB_UPDATE_TIME EDT_ADD_IPS EDT_FAKE_PAGE
+            EDT_TG_BOT EDT_TG_CHAT EDT_CF_EMAIL EDT_CF_KEY EDT_CF_TOKEN EDT_DROP_KV=1（拆除时连 KV 一起删）`);
 }
 
 async function main() {

@@ -142,7 +142,7 @@ CF Workers Free 每请求 CPU 上限 10ms —— **500 节点只用 0.74ms，完
 
 1. **别用"测试真延迟"全量测速。** 500 个节点逐个建连 = 500 个 Worker 请求 + 几分钟等待。用「测试可用TTFB」或只测选中分组。
 2. **随机 IP 每次拉订阅都重新生成。** 节点名不变（`CF电信优选1..500`）但 IP 全换，所以测速结果无法复用。
-   想要稳定节点池：把实测低延迟的 IP 写进 KV 的 `ADD.txt`，并把 `优选订阅生成.本地IP库.随机IP` 设为 `false`。
+   想要稳定节点池：把实测低延迟的 IP 用部署器写入 KV `ADD.txt` 并关闭随机 IP（一条命令，见 §7.9）。
 3. **必须在【完全直连、没挂任何代理】的状态下拉订阅。** 挂了梯子刷新会让 `cf.country != CN`（L5869）退化成 `cf` 全量池，拿不到运营商优化线路。
 
 ### 配额红线
@@ -197,6 +197,19 @@ CF Workers Free 每请求 CPU 上限 10ms —— **500 节点只用 0.74ms，完
 --transport <t>      ws | grpc | xhttp
 --path </p>          节点基础路径
 --sub-name <名>      订阅显示名
+
+# 节点池
+--add-ips <列表>      稳定节点池：ip:port[,ip:port] 或 file:路径（每行一条，可带 #名称）。
+                      会写入 KV ADD.txt 并关闭随机IP —— 2 小时自动刷新不再换 IP（见 §7）
+--random-ips          恢复随机 IP 模式（与 --add-ips 互斥）
+
+# 伪装页
+--fake-page <域名>    env.URL：nginx=内置默认页 / 1101=内置HTML / 站点域名=反代该站当伪装
+
+# 通知 / 用量统计（写 KV tg.json / cf.json，Worker 覆盖读取）
+--tg-bot <token> --tg-chat <id>   订阅访问 TG 通知
+--cf-email <邮箱> --cf-key <GAK>   CF 用量统计（Global API Key）
+--cf-token <token>                或改用 API Token（与上面二选一）
 
 # 反代
 --proxyip <h:port>   反代出口；默认 auto 走 {colo}.proxyip.cmliussss.net
@@ -286,11 +299,41 @@ L459/L5932 把 UA 伪装成 `Subconverter for...` / `v2rayN/edgetunnel`。
 这是主动规避 GitHub 关键词扫描和 DMCA 的手法（该仓库历史上被删过）。
 ⇒ **必须本地留存源码 + 锁版本**，别 hotlink upstream。`_et/` 目录就是干这个的。
 
-### 7.7 凭据落盘
+### 7.9 稳定节点池 + CIDR 的真相（--add-ips）
+
+**CIDR 不是写死的**：`生成随机IP()`（L5875）每次生成订阅都**运行时从上游拉取**最新 `CF-CIDR.txt` /
+`CF-CIDR/{ct,cu,cmcc}.txt`，拉取失败兜底 `104.16.0.0/13`（L5889）。`_et/` 里那 4 个 txt 只是上游文件的
+本地存档副本，**部署和线上都不使用它们**，上游更新即生效，无需我们刷新。所以「定期刷新 CIDR」是个伪需求。
+
+**稳定节点池（--add-ips）**：随机模式下 2 小时自动刷新会让 500 个 IP 全换。想要长期稳定的节点：
+
+```bash
+# 方式一：命令行直接给（可带 #名称）
+node deploy-edgetunnel.mjs --reconfigure --add-ips '8.39.125.243:2053,1.1.1.1:443#稳定1'
+
+# 方式二：本地文件，每行一条（推荐，方便用脚本探测后落盘）
+node deploy-edgetunnel.mjs --reconfigure --add-ips 'file:./stable-ips.txt'
+
+# 想恢复随机模式
+node deploy-edgetunnel.mjs --reconfigure --random-ips
+```
+
+脚本会：写 KV `ADD.txt` + 把 config 的 `随机IP` 置 `false`（Worker L358 优先读 ADD.txt）。
+此后每次刷新节点列表稳定不变。取 IP 的技巧：先用随机模式挑出真实延迟低的节点，把它的 IP:端口记下来，
+或用 `probe-random-ip.mjs` / `probe-entrances.mjs` 批量探测后生成 stable-ips.txt。
+
+**伪装页（--fake-page）**：默认 `nginx` 内置页；`--fake-page 1101` 用内置 HTML；`--fake-page example.com`
+会把你的域名伪装成该站（反代其首页，替换其中的域名引用），配合 SNI 更像真实站点。
+
+**TG 通知 / CF 用量统计**：`--tg-bot <token> --tg-chat <id>` 每次订阅访问发 TG 通知（注意：会有点吵）；
+`--cf-email/--cf-key` 或 `--cf-token` 启用面板里的用量统计。凭据写入 KV `tg.json`/`cf.json`，Worker 覆盖读取
+（L5797/L5812），config.json 里相应字段可留空。
+
+### 7.10 凭据落盘
 
 `edgetunnel-credentials.json` 里有 ADMIN 和 KEY 明文。这台机器的目录如果同步到网盘或提交进 git，等于凭据外泄。用完按需删除。
 
-### 7.8 旧内核遗留问题（本方案已顺带解决）
+### 7.11 旧内核遗留问题（本方案已顺带解决）
 
 旧 `worker.fixed.js` 的建链竞态（`messageHandler` 在 `await` 之后才赋值，建链期间到达的包被当首包重解析）——
 edgetunnel 用 `处理WS入站数据` + 首包状态机（L1635）规避了，这也是换内核的隐性收益之一。
