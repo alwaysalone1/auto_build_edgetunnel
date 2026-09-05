@@ -1,0 +1,11 @@
+# ── 部署/重配时自动生成的本地文件（含真实凭据，禁止提交）──
+edgetunnel-credentials.json
+edgetunnel-deploy.state.json
+edgetunnel.config.json
+
+# ── 原始素材存档（LINUX DO 论坛网页存档，不属于本项目代码）──
+源码来源/
+
+# ── 常规 ──
+node_modules/
+*.log
