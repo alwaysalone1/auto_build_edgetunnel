@@ -536,6 +536,16 @@ async function createApiTokenFromDashboardSession({ accountId, vses2, cookie, at
   if (!ACCOUNT_ID_RE.test(accountId || '')) throw new Error('缺少或非法的 Cloudflare account id。');
   if (!sessionCookie({ cookie, vses2 })) throw new Error('缺少登录态。用 --vses2 传入，或用 --cookie 传入完整 Cookie。');
   const session = { accountId, vses2, cookie, atok };
+  // 前置检查：创建 Token 要求邮箱已验证（错误 1211）。提前 GET /user 报出确切邮箱，避免流程跑到一半才失败。
+  try {
+    const user = await dashboardSessionFetch('/user', session);
+    if (user?.email_verified === false) {
+      throw new Error(`该 Cloudflare 账号的邮箱（${user.email || '未知'}）未验证（email_verified=false）。\n请用该邮箱登录 dash.cloudflare.com → 右上角头像 → 个人资料 → 邮箱，重新发送验证邮件并点击邮件里的确认链接，验证后再重跑。`);
+    }
+  } catch (e) {
+    if (/未验证/.test(e.message)) throw e;
+    // /user 查询失败不阻塞主流程，留给后续 /user/tokens 的 1211 兜底提示
+  }
   const policies = [];
   for (const policy of DEFAULT_TOKEN_PAYLOAD.policies) {
     const wantedScopes = scopesFromResources(policy.resources);
