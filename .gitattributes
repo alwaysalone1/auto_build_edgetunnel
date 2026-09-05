@@ -1,0 +1,8 @@
+# 统一 LF 换行，避免 CRLF 噪音（Windows 检出时仍可用 CRLF）
+* text=auto
+*.mjs text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.toml text eol=lf

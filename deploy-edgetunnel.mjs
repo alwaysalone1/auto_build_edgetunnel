@@ -23,6 +23,12 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 
+// 脚本依赖全局 fetch / AbortSignal.timeout，Node < 18 会静默失败，提前给出可读报错
+if (Number(process.versions.node.split('.')[0]) < 18) {
+  console.error(`\n需要 Node.js >= 18（脚本使用全局 fetch / AbortSignal），当前版本：${process.versions.node}`);
+  process.exit(1);
+}
+
 const API_BASE = 'https://api.cloudflare.com/client/v4';
 const DASH_API_BASE = 'https://dash.cloudflare.com/api/v4';
 const ACCOUNT_ID_RE = /^[a-f0-9]{32}$/i;
@@ -713,23 +719,52 @@ async function verifySubscription(host) {
  * 8. 运维：撤销 Token / 拆除
  * ──────────────────────────────────────────────────────────────── */
 async function revokeToken() {
+  // 优先按 state.tokenId 删除（用户级 Token 正确端点是 /user/tokens/{id}）。
+  // 纯撤销模式不再先创建新 Token（旧逻辑会建了再删、还覆盖 state.tokenId）。
+  if (state.tokenId) {
+    try {
+      if (config.token) {
+        await bearerFetch(`/user/tokens/${state.tokenId}`, { method: 'DELETE' });
+      } else if (dashboardCookie()) {
+        await dashboardSessionFetch(`/user/tokens/${state.tokenId}`, {
+          method: 'DELETE', accountId: config.accountId,
+          vses2: config.dashboardVses2, cookie: config.dashboardCookie, atok: config.dashboardAtok,
+        });
+      } else {
+        log('revoke', `state 记录了 tokenId=${state.tokenId}，但缺少 --api-token 或 --vses2/--cookie，无法删除`);
+        return;
+      }
+      log('revoke', `已删除 Token：${state.tokenId}`);
+      return;
+    } catch (e) {
+      if (/404|1000[345]|does not exist/i.test(e.message)) {
+        log('revoke', `Token ${state.tokenId} 已不存在（可能已删），跳过`);
+        return;
+      }
+      log('revoke', `按 id 删除失败（${e.message}），尝试按值撤销`);
+    }
+  }
   if (!config.token) { log('revoke', '当前没有 Token 可撤销'); return; }
   try {
     await bearerFetch('/user/tokens/value', { method: 'DELETE' });
     log('revoke', '部署 Token 已撤销');
-  } catch (e) {
-    if (state.tokenId) {
-      // 用户级 Token（/user/tokens 创建）必须从 /user/tokens/{id} 删，不是 /accounts/{aid}/tokens/{id}
-      await cfFetch(`/user/tokens/${state.tokenId}`, { method: 'DELETE' }).catch(() => {});
-      log('revoke', `已按 id 删除 Token：${state.tokenId}`);
-    } else log('revoke', `撤销失败：${e.message}`);
-  }
+  } catch (e) { log('revoke', `撤销失败：${e.message}`); }
 }
 
 async function destroy() {
-  const { zoneName, hostname, workerName, zoneId, kvId, dnsRecordId, routeId } = state;
+  const { hostname, workerName, kvId } = state;
   if (!workerName && !hostname) fail('state 文件里没有可拆除的资源记录。');
-  log('destroy', `拆除：route=${routeId || '按 pattern 查'} dns=${hostname} worker=${workerName} kv=${kvId || '保留'}`);
+  // reconfigure 路径的 state 可能没有 zoneId：按 hostname 的注册域后缀反查 Zone
+  let zoneId = state.zoneId;
+  if (!zoneId && hostname) {
+    const suffix = hostname.split('.').slice(-2).join('.');
+    const zones = await cfFetch(`/zones?name=${encodeURIComponent(suffix)}`).catch(() => []);
+    if (zones?.length) {
+      zoneId = zones[0].id;
+      log('destroy', `state 缺 zoneId，按 ${suffix} 解析到 ${zoneId}`);
+    }
+  }
+  log('destroy', `拆除：route=${hostname ? `${hostname}/*` : '无'} dns=${hostname || '无'} worker=${workerName || '无'} kv=${kvId || '保留'}`);
   if (config.dryRun) { log('destroy', '[dry-run] 以上资源将被删除，KV 命名空间默认保留'); return; }
   if (zoneId && hostname) {
     const routes = await cfFetch(`/zones/${zoneId}/workers/routes`).catch(() => []);
@@ -842,10 +877,7 @@ function ensureConfig() {
   // dry-run 只打印计划，不该要求凭据，也不该要求源文件之外的东西
   if (!config.accountId && !config.dryRun) fail('缺少 --account-id（或用 state 文件记住）。');
   if (!config.token && !dashboardCookie() && !config.dryRun) fail('缺少 --api-token；要让脚本自动建 Token，请提供 --vses2 或 --cookie。');
-  if (config.reconfigure) return;
-  if (!config.zoneName) fail('缺少根域名 --zone。edgetunnel 的 /sub、/admin、<KEY> 都靠域名路由。');
-  if (!config.hostname.endsWith(config.zoneName)) fail(`--hostname 必须在 ${config.zoneName} 下面。`);
-  if (!existsSync(config.workerSource) && !config.dryRun) fail(`找不到 Worker 源文件：${config.workerSource}\n先执行：curl -o _et/_worker.js https://raw.githubusercontent.com/cmliu/edgetunnel/main/_worker.js`);
+  // 规模/协议/端口/刷新间隔校验放在 reconfigure return 之前 —— reconfigure 同样用到这些参数
   if (!Number.isInteger(config.nodes) || config.nodes < 1 || config.nodes > 2000) fail('--nodes 需在 1..2000 之间。');
   if (!Number.isFinite(config.subUpdateTime) || config.subUpdateTime < 1 || config.subUpdateTime > 168) fail('--sub-update-time 需在 1..168（小时）之间。');
   if (!['vless', 'trojan', 'ss'].includes(config.protocol)) fail('--protocol 只能是 vless | trojan | ss');
@@ -853,6 +885,10 @@ function ensureConfig() {
   if (config.port !== -1 && ![443, 2053, 2083, 2087, 2096, 8443, 80, 8080, 2052, 2082, 2086, 2095].includes(config.port)) {
     fail(`--port ${config.port} 不是 CF 支持的端口。可选：443 2053 2083 2087 2096 8443（TLS）/ 80 2052 2082 2086 2095 8080（非 TLS）；-1 表示随机。`);
   }
+  if (config.reconfigure) return;
+  if (!config.zoneName) fail('缺少根域名 --zone。edgetunnel 的 /sub、/admin、<KEY> 都靠域名路由。');
+  if (!config.hostname.endsWith(config.zoneName)) fail(`--hostname 必须在 ${config.zoneName} 下面。`);
+  if (!existsSync(config.workerSource) && !config.dryRun) fail(`找不到 Worker 源文件：${config.workerSource}\n先执行：curl -o _et/_worker.js https://raw.githubusercontent.com/cmliu/edgetunnel/main/_worker.js`);
 }
 
 function usage() {
@@ -899,10 +935,12 @@ async function main() {
   if (config.destroy) {
     log('destroy', '开始拆除');
     await ensureApiToken();
-    await destroy();
-    if (config.revokeToken) await revokeToken();
+    await destroy(); // destroy() 内部已按 --keep-token 决定是否撤销
     return;
   }
+
+  // 纯撤销：直接用 state.tokenId + 会话凭据，不创建新 Token
+  if (config.revokeToken) { await revokeToken(); return; }
 
   await ensureApiToken();
 

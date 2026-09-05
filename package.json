@@ -1,0 +1,25 @@
+{
+  "name": "auto-build-edgetunnel",
+  "version": "2.1.0",
+  "description": "cmliu/edgetunnel 2.1 一键部署器：Cloudflare API 自动部署 Worker/KV/DNS/Route，产出 v2rayN 原生订阅（VLESS+WS+TLS，500 节点，2 小时自动刷新）",
+  "type": "module",
+  "private": true,
+  "license": "GPL-2.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "deploy": "node deploy-edgetunnel.mjs",
+    "reconfigure": "node deploy-edgetunnel.mjs --reconfigure",
+    "verify": "node verify-derive.mjs && node verify-config-keys.mjs"
+  },
+  "dependencies": {},
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "edgetunnel",
+    "vless",
+    "v2rayn",
+    "subscription"
+  ]
+}
