@@ -703,7 +703,12 @@ async function findZone() {
   if (!zone) {
     if (config.dryRun) { log('1', `[dry-run] 将添加 Zone ${config.zoneName}`); return { id: '(dry-run)', name_servers: [] }; }
     log('1', `账号里还没有这个 Zone，正在添加：${config.zoneName}`);
-    zone = await cfFetch('/zones', { method: 'POST', body: JSON.stringify({ name: config.zoneName, account: { id: config.accountId }, type: 'full' }) });
+    zone = await cfFetch('/zones', { method: 'POST', body: JSON.stringify({ name: config.zoneName, account: { id: config.accountId }, type: 'full' }) }).catch((e) => {
+      if (/1106|not allowed to create new zones/i.test(e.message)) {
+        throw new Error(`Cloudflare 拒绝添加 Zone（错误 1106）：该账号当前被限制新建 Zone。\n常见原因：账号太新（Cloudflare 反滥用机制，新账号需“冷却”几小时~几天）或短时间内连续注册/建 Zone。\n解决办法：\n  1) 等 1-3 天再试，或到 dash.cloudflare.com 网页「Add site」手动添加一次；\n  2) 或者复用已有账号的已激活 Zone（如 autoproxy1/2.ccwu.cc）部署，完全绕开此限制。\n原始报错：${e.message}`);
+      }
+      throw e;
+    });
   }
   log('1', `Zone ID：${zone.id}${zone.status ? `  状态：${zone.status}` : ''}`);
   const ns = zone.name_servers || zone.original_name_servers || [];
