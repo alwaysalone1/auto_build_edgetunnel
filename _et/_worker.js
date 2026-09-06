@@ -1,4 +1,4 @@
-﻿const Version = '2026-09-04 16:24:13';
+const Version = '2026-09-04 16:24:13';
 let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 const Pages静态页面 = 'https://edt-pages.github.io';
@@ -1668,7 +1668,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 			const 解析结果 = 解析木马请求(chunk, yourUUID);
 			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
 			const { port, hostname, rawClientData, isUDP } = 解析结果;
-			if (isSpeedTestSite(hostname) && 反代上下文.代理类型 === null) {
+			if (isSpeedTestSite(hostname) && 反代上下文.代理类型 === null && 查找HTTP请求头结尾(rawClientData) !== -1) {
 				await 启用WS本地测速模式(serverSock, null, rawClientData);
 				return;
 			}
@@ -1689,7 +1689,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid 魏烈思 request');
 			const { port, hostname, version, isUDP, rawClientData } = 解析结果;
 			const respHeader = new Uint8Array([version, 0]);
-			if (isSpeedTestSite(hostname) && 反代上下文.代理类型 === null) {
+			if (isSpeedTestSite(hostname) && 反代上下文.代理类型 === null && 查找HTTP请求头结尾(rawClientData) !== -1) {
 				await 启用WS本地测速模式(serverSock, respHeader, rawClientData);
 				return;
 			}
@@ -2402,9 +2402,17 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 						finally { try { writer.releaseLock() } catch (e) { } }
 					}
 				} else {
-					log(`[反代连接] 代理到: ${host}:${portNum}`);
-					const 所有反代数组 = await 解析地址端口(ctx反代IP, host, yourUUID);
-					newSocket = await connectProxyIP(`${特征码字典[0]}.tp1.${特征码字典[2]}.xyz`, 1, 本次首包数据, 所有反代数组, ctx反代兜底);
+					// [auto_build_edgetunnel 补丁] 直连优先：默认反代（PROXYIP.tp1.cmliu.xyz 等第三方域）
+					// 已失效/挂起会导致所有连接 0 数据。改为先直连目标（request.fetcher.connect 实测 35ms 可用），
+					// 直连失败才回退第三方反代；回退仍失败则按原有 反代兜底 逻辑收尾。
+					log(`[直连优先] 目标: ${host}:${portNum}`);
+					try {
+						newSocket = await connectDirect(host, portNum, 本次首包数据, false);
+					} catch (直连失败) {
+						log(`[直连优先] 直连失败(${直连失败?.message || 直连失败})，回退反代`);
+						const 所有反代数组 = await 解析地址端口(ctx反代IP, host, yourUUID);
+						newSocket = await connectProxyIP(`${特征码字典[0]}.tp1.${特征码字典[2]}.xyz`, 1, 本次首包数据, 所有反代数组, ctx反代兜底);
+					}
 				}
 				await 安装当前连接(newSocket, 当前连接世代, downlinkDrain);
 				if (本次发送首包) 已通过代理发送首包 = true;
